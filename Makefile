@@ -23,7 +23,7 @@ $(BUILD)/pras3: pras3.c | $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@
 
 $(BUILD)/pras3_linux: pras3.c | $(BUILD)
-	zig cc -target x86_64-linux-gnu -D_DEFAULT_SOURCE $(CFLAGS) $< -o $@
+	zig cc -target x86_64-linux-musl -D_DEFAULT_SOURCE $(CFLAGS) $< -o $@
 
 $(BUILD)/pras3.exe: pras3.c | $(BUILD)
 	zig cc -target x86_64-windows-gnu $(CFLAGS) $< -o $@

@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <limits.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -51,6 +52,28 @@ struct SerialOptions {
 };
 
 #if IS_WINDOWS
+
+static void sleep_ns(uint64_t nanoseconds)
+{
+	// This won't be nanosecond-accurate but we don't really care.
+	DWORD const milliseconds = nanoseconds / UINT64_C(1000000);
+	Sleep(milliseconds);
+}
+
+static uint64_t now_ns(void)
+{
+	LARGE_INTEGER frequency;
+	(void)QueryPerformanceFrequency(&frequency);
+
+	LARGE_INTEGER count;
+	(void)QueryPerformanceCounter(&count);
+
+	uint64_t const ns_per_second = UINT64_C(1000000000);
+	uint64_t const seconds = count.QuadPart / frequency.QuadPart;
+	uint64_t const nanoseconds = ((count.QuadPart % frequency.QuadPart) * ns_per_second) / frequency.QuadPart;
+
+	return seconds * ns_per_second + nanoseconds;
+}
 
 struct OptionalSerial Serial_open(char const* path, struct SerialOptions const* options)
 {
@@ -145,6 +168,24 @@ bool Serial_write(Serial serial, uint8_t const* buff, size_t size)
 
 #else
 
+static void sleep_ns(uint64_t nanoseconds)
+{
+	uint64_t const ns_per_second = UINT64_C(1000000000);
+	struct timespec const t = {
+		.tv_sec = nanoseconds / ns_per_second,
+		.tv_nsec = nanoseconds % ns_per_second,
+	};
+	(void)nanosleep(&t, NULL);
+}
+
+static uint64_t now_ns(void)
+{
+	struct timespec t;
+	(void)clock_gettime(CLOCK_MONOTONIC_RAW, &t);
+	uint64_t const ns_per_second = UINT64_C(1000000000);
+	return t.tv_sec * ns_per_second + t.tv_nsec;
+}
+
 #if IS_MACOS
 #	define CMSPAR 0
 #endif
@@ -154,7 +195,7 @@ static struct termios set_termios(struct termios tty, struct SerialOptions const
 	speed_t const speed = B115200;
 
 	tty.c_cflag |= CLOCAL | CREAD;
-	tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG | IEXTEN);
+	tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG | IEXTEN | ECHOCTL | ECHOKE);
 	tty.c_oflag &= ~(OPOST | ONLCR | OCRNL);
 	tty.c_iflag &= ~(INLCR | IGNCR | ICRNL | IGNBRK);
 
@@ -163,12 +204,15 @@ static struct termios set_termios(struct termios tty, struct SerialOptions const
 #	endif
 	tty.c_iflag &= ~PARMRK;
 
-	tty.c_ispeed = tty.c_ospeed = speed;
+	cfsetispeed(&tty, speed);
+	cfsetospeed(&tty, speed);
+
 	tty.c_cflag &= ~CSIZE;
 	tty.c_cflag |= CS8;
 	tty.c_cflag &= ~(CSTOPB);
 	tty.c_iflag &= ~(INPCK | ISTRIP);
 	tty.c_cflag &= ~(PARENB | PARODD | CMSPAR);
+	tty.c_iflag &= ~(IXON | IXOFF | IXANY);
 
 	if (options->rtscts) {
 		tty.c_cflag |= CRTSCTS;
@@ -236,9 +280,23 @@ bool Serial_read(Serial serial, uint8_t* buff, size_t size)
 	// Even though the fd is in blocking mode, serial is special
 	// and can still return early or timeout so we must loop.
 	int const fd = serial;
+	fd_set read_fds;
 	uint8_t* cursor = buff;
 	uint8_t const* end = buff + size;
 	while (cursor < end) {
+		FD_ZERO(&read_fds);
+		FD_SET(fd, &read_fds);
+		struct timeval timeout = {
+			.tv_sec = 1,
+		};
+		int ready_count = select(fd + 1, &read_fds, NULL, NULL, &timeout);
+		if (ready_count < 0) {
+			fprintf(stderr, "Failed to wait for serial port to be ready to read: (%d: %s)\n", errno, strerror(errno));
+			return false;
+		}
+		if (ready_count == 0 || !FD_ISSET(fd, &read_fds)) {
+			continue;
+		}
 		ssize_t bytes_read = read(fd, cursor, size);
 		if (bytes_read == 0) {
 			fprintf(stderr, "Read timed out.\n");
@@ -293,6 +351,31 @@ static uint8_t jvs_checksum(void const* buff, size_t size, uint8_t starting_valu
 		sum += bytes[i];
 	}
 	return sum;
+}
+
+static bool jvs_read_encoded(Serial serial, void* out_buff, size_t size)
+{
+	uint8_t* cursor = out_buff;
+	while (size) {
+		uint8_t byte;
+		if (!Serial_read(serial, &byte, sizeof(byte))) {
+			fprintf(stderr, "Failed to read JVS byte.\n");
+			return false;
+		}
+		if (byte == 0xd0) {
+			if (!Serial_read(serial, &byte, sizeof(byte))) {
+				fprintf(stderr, "Failed to read escaped JVS byte.\n");
+				return false;
+			}
+			byte++;
+		}
+		if (cursor) {
+			*cursor = byte;
+			cursor++;
+		}
+		size--;
+	}
+	return true;
 }
 
 struct Color
@@ -597,15 +680,534 @@ static int run_tool_led(int argc, char** argv)
 	return 0;
 }
 
+static void print_usage_nfc(void)
+{
+	fprintf(stderr, "\n");
+	fprintf(stderr, "pras3 nfc [--port path] [--color x,x,x] [--wait_for_specific <hex UID>] [--wait_for_any <count>] [--timeout <seconds>]\n");
+	fprintf(stderr, "--port <path>                  The serial port path.\n");
+	fprintf(stderr, "--color <0-255,0-255,0-255>    Default color to set all LEDs to.\n");
+	fprintf(stderr, "--wait_for_specific <hex uid>  The hex representation of a specific UID of a\n");
+	fprintf(stderr, "                               card to wait for.\n");
+	fprintf(stderr, "--wait_for_any <count>         Wait for and print <count> unique card UIDs\n");
+	fprintf(stderr, "                               before ending.\n");
+	fprintf(stderr, "--timeout <seconds>            Stop unconditionally after waiting for <seconds>.\n");
+	fprintf(stderr, "                               Default is 0 which will wait forever.\n");
+}
+
+struct UID {
+	uint8_t bytes[16];
+	uint8_t length;
+};
+
+bool UID_is_equal(struct UID const* lhs, struct UID const* rhs)
+{
+	if (lhs->length != rhs->length) {
+		return false;
+	}
+	return 0 == memcmp(lhs->bytes, rhs->bytes, lhs->length);
+}
+
+struct UIDString {
+	char chars[sizeof(((struct UID*)0)->bytes) * 2 + 1];
+};
+
+struct UIDString UIDString_from_UID(struct UID const* uid)
+{
+	static char const nibble_to_char[16] = {
+		'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+	};
+	struct UIDString result = {};
+	char* cursor = result.chars;
+	for (size_t i = 0; i < uid->length; i++) {
+		cursor[0] = nibble_to_char[(0xf0 & uid->bytes[i]) >> 4];
+		cursor[1] = nibble_to_char[(0x0f & uid->bytes[i]) >> 0];
+		cursor += 2;
+	}
+	*cursor = '\0';
+	return result;
+}
+
+struct OptionalUID {
+	bool has_value;
+	struct UID uid;
+};
+
+struct OptionalUID UID_from_string(char const* str)
+{
+	struct OptionalUID maybe = {};
+	char const* cursor = str;
+	static uint8_t const char_to_hex[0xff] = {
+		['0'] = 0x0,
+		['1'] = 0x1,
+		['2'] = 0x2,
+		['3'] = 0x3,
+		['4'] = 0x4,
+		['5'] = 0x5,
+		['6'] = 0x6,
+		['7'] = 0x7,
+		['8'] = 0x8,
+		['9'] = 0x9,
+		['a'] = 0xa,
+		['b'] = 0xb,
+		['c'] = 0xc,
+		['d'] = 0xd,
+		['e'] = 0xe,
+		['f'] = 0xf,
+	};
+
+	size_t char_count = 0;
+	uint8_t value = 0;
+	size_t const max_uid_len = sizeof(maybe.uid.bytes);
+	while (*cursor != '\0' && char_count < max_uid_len * 2) {
+		uint8_t const nibble = char_to_hex[(uint8_t)*cursor];
+		if (nibble == 0 && *cursor != '0') {
+			fprintf(stderr, "Bad character in hex string: '%c'\n", *cursor);
+			return (struct OptionalUID){};
+		}
+		value = (value << 4) | nibble;
+		if (char_count & 1) {
+			maybe.uid.bytes[maybe.uid.length++] = value;
+			value = 0;
+		}
+		cursor++;
+		char_count++;
+	}
+	if (*cursor != '\0') {
+		fprintf(stderr, "UID string is too long. Max length is %zu bytes.\n", max_uid_len);
+		return maybe;
+	}
+	if (char_count & 1) {
+		fprintf(stderr, "Odd number of hex characters found but an even number are required\n");
+		return maybe;
+	} else {
+		maybe.has_value = true;
+	}
+	return maybe;
+}
+
+static bool UID_is_in_array(struct UID const* seen_uids, size_t count, struct UID const* uid)
+{
+	for (size_t i = 0; i < count; i++) {
+		if (UID_is_equal(&seen_uids[i], uid)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void UID_test(void)
+{
+	struct OptionalUID maybe_uid;
+	// Bad strings.
+	// Invalid characters.
+	maybe_uid = UID_from_string("xx");
+	assert(!maybe_uid.has_value);
+	// Odd number of chars.
+	maybe_uid = UID_from_string("1");
+	assert(!maybe_uid.has_value);
+	// No leading '0x'.
+	maybe_uid = UID_from_string("0xff");
+	assert(!maybe_uid.has_value);
+	// Too long.
+	maybe_uid = UID_from_string("00112233445566778899aabbccddeeff00");
+	assert(!maybe_uid.has_value);
+
+	// Good strings.
+	maybe_uid = UID_from_string("ff");
+	assert(0 == strcmp("ff", UIDString_from_UID(&maybe_uid.uid).chars));
+	maybe_uid = UID_from_string("001122aabbcc");
+	assert(0 == strcmp("001122aabbcc", UIDString_from_UID(&maybe_uid.uid).chars));
+	maybe_uid = UID_from_string("00112233445566778899aabbccddeeff");
+	assert(0 == strcmp("00112233445566778899aabbccddeeff", UIDString_from_UID(&maybe_uid.uid).chars));
+}
+
+struct ArgsNFC {
+	char const* port;
+	struct OptionalColor color;
+	int wait_for_any;
+	struct OptionalUID wait_for_specific;
+	int timeout;
+};
+
+static bool ArgsNFC_parse(struct ArgsNFC* args, int argc, char** argv)
+{
+	*args = (struct ArgsNFC){};
+	if (IS_WINDOWS) {
+		args->port = "COM3";
+	} else {
+		args->port = "/dev/ttyS2";
+	}
+	struct option const longopts[] = {
+		{"port",              required_argument, NULL, 'p'},
+		{"color",             required_argument, NULL, 'c'},
+		{"wait_for_specific", required_argument, NULL, 's'},
+		{"wait_for_any",      required_argument, NULL, 'a'},
+		{"timeout",           required_argument, NULL, 't'},
+		{},
+	};
+	int c;
+	optind = 1;
+	while (-1 != (c = getopt_long(argc, argv, "", longopts, NULL))) {
+		switch (c) {
+			case 'p': {
+				args->port = optarg;
+			} break;
+			case 'c': {
+				args->color = Color_from_string(optarg);
+				if (!args->color.has_value) {
+					fprintf(stderr, "Could not parse color for --color '%s'\n", optarg);
+					return false;
+				}
+			} break;
+			case 's': {
+				args->wait_for_specific = UID_from_string(optarg);
+				if (!args->wait_for_specific.has_value) {
+					fprintf(stderr, "Could not parse UID value: '%s'\n", optarg);
+					return false;
+				}
+			} break;
+			case 'a': {
+				char* end;
+				args->wait_for_any = strtol(optarg, &end, 0);
+				if (end != (optarg + strlen(optarg))) {
+					fprintf(stderr, "Could not parse count for wait_for_any: '%s'\n", optarg);
+					return false;
+				}
+			} break;
+			case 't': {
+				char* end;
+				args->timeout = strtol(optarg, &end, 0);
+				if (end != (optarg + strlen(optarg))) {
+					fprintf(stderr, "Could not parse timeout value: '%s'\n", optarg);
+					return false;
+				}
+			} break;
+			default: {
+				fprintf(stderr, "Unknown option '%s'\n", argv[optopt]);
+				return false;
+			} break;
+		}
+	}
+	if (args->wait_for_specific.has_value && args->wait_for_any > 0) {
+		fprintf(stderr, "--wait_for_any and --wait_for_specific are mutually exclusive. You must only use one.\n");
+		return false;
+	}
+	if (args->wait_for_any < 0) {
+		fprintf(stderr, "--wait_for_any must not be negative.\n");
+		return false;
+	}
+	return true;
+}
+
+struct NFC {
+	Serial serial;
+	uint8_t seqence;
+};
+
+static bool NFC_cmd_send_(struct NFC* nfc, uint8_t cmd_id, void const* buff, size_t size)
+{
+	nfc->seqence++;
+
+	uint8_t checksum;
+	struct NFCHeader {
+		uint8_t addr;
+		uint8_t sequence;
+		uint8_t command;
+		uint8_t payload_length;
+	} const header = {
+		.addr = 0,
+		.sequence = nfc->seqence,
+		.command = cmd_id,
+		.payload_length = size,
+	};
+	uint8_t const buffer_length = sizeof(header) + size + sizeof(checksum);
+
+	checksum = jvs_checksum(&buffer_length, sizeof(buffer_length), 0);
+	checksum = jvs_checksum(&header, sizeof(header), checksum);
+	checksum = jvs_checksum(buff, size, checksum);
+
+	uint8_t encoded_buff[2 * (sizeof(header) + 255 + sizeof(checksum))];
+	size_t encoded_size;
+
+	encoded_buff[0] = 0xe0;
+	encoded_size = 1;
+	encoded_size += jvs_encode(&buffer_length, sizeof(buffer_length), encoded_buff + encoded_size);
+	encoded_size += jvs_encode(&header, sizeof(header), encoded_buff + encoded_size);
+	encoded_size += jvs_encode(buff, size, encoded_buff + encoded_size);
+	encoded_size += jvs_encode(&checksum, sizeof(checksum), encoded_buff + encoded_size);
+
+	if (!Serial_write(nfc->serial, encoded_buff, encoded_size)) {
+		fprintf(stderr, "Failed to write NFC command to serial\n");
+		return false;
+	}
+	return true;
+}
+
+static bool NFC_response_recv_(Serial serial, void* out_payload, size_t* out_size)
+{
+	uint8_t sync;
+	if (!Serial_read(serial, &sync, sizeof(sync))) {
+		fprintf(stderr, "Failed to read sync byte\n");
+		return false;
+	}
+	if (sync != 0xe0) {
+		fprintf(stderr, "Unexpected sync value 0x%02x\n", sync);
+		return false;
+	}
+	uint8_t size;
+	if (!jvs_read_encoded(serial, &size, sizeof(size))) {
+		fprintf(stderr, "Failed to read response size\n");
+		return false;
+	}
+	struct NFCResponseHeader {
+		uint8_t addr;
+		uint8_t seq;
+		uint8_t command;
+		uint8_t status;
+		uint8_t payload_length;
+	} header;
+	if (!jvs_read_encoded(serial, &header, sizeof(header))) {
+		fprintf(stderr, "Failed to read NFC response header.\n");
+		return false;
+	}
+	if (out_size) {
+		*out_size = header.payload_length;
+	}
+	if (!jvs_read_encoded(serial, out_payload, header.payload_length)) {
+		fprintf(stderr, "Failed to read NFC response payload.\n");
+		return false;
+	}
+	uint8_t checksum;
+	if (!jvs_read_encoded(serial, &checksum, sizeof(checksum))) {
+		fprintf(stderr, "Failed to read NFC response checksum.\n");
+		return false;
+	}
+	// We're ignoring the checksum.
+	return header.status == 0;
+}
+
+enum NFCCardType
+{
+	kNFCCardType_MIFARE = 1,
+	kNFCCardType_FeliCa = 2,
+};
+
+static bool NFC_reset(struct NFC* nfc)
+{
+	uint8_t const cmd = 0x62;
+	if (!NFC_cmd_send_(nfc, cmd, NULL, 0)) {
+		fprintf(stderr, "Failed to send NFC 'reset' command.\n");
+		return false;
+	}
+	return NFC_response_recv_(nfc->serial, NULL, NULL);
+}
+
+static bool NFC_led_get_info(struct NFC* nfc)
+{
+	uint8_t const cmd = 0xf0;
+	if (!NFC_cmd_send_(nfc, cmd, NULL, 0)) {
+		fprintf(stderr, "Failed to send NFC 'get info' command.\n");
+		return false;
+	}
+	// We don't really care about the payload at the moment, but it does have one.
+	return NFC_response_recv_(nfc->serial, NULL, 0);
+}
+
+static bool NFC_led_set_color(struct NFC* nfc, struct Color color)
+{
+	uint8_t const cmd = 0x81;
+	// There is no response to process.
+	return NFC_cmd_send_(nfc, cmd, &color, sizeof(color));
+}
+
+static bool NFC_radio_on(struct NFC* nfc, uint8_t card_type)
+{
+	assert(card_type == kNFCCardType_MIFARE || card_type == kNFCCardType_FeliCa);
+	uint8_t const cmd = 0x40;
+	if (!NFC_cmd_send_(nfc, cmd, &card_type, sizeof(card_type))) {
+		fprintf(stderr, "Failed to send 'radio on' command.\n");
+		return false;
+	}
+	return NFC_response_recv_(nfc->serial, NULL, 0);
+}
+
+struct NFCCard {
+	uint8_t type;
+	struct UID uid;
+};
+
+struct NFCCardIterator {
+	uint8_t bytes[256];
+	uint8_t const* cursor;
+	uint8_t const* end;
+	uint8_t count;
+};
+
+static bool NFCCardIterator_next(struct NFCCardIterator* iter, struct NFCCard* card)
+{
+	if (iter->count == 0) {
+		return false;
+	}
+	uint8_t type;
+	memcpy(&type, iter->cursor, sizeof(type));
+	iter->cursor += sizeof(type);
+	card->type = (type >> 4) & 0xf;
+	if (iter->cursor == iter->end) {
+		iter->count = 0;
+		return false;
+	}
+
+	uint8_t size;
+	memcpy(&size, iter->cursor, sizeof(size));
+	iter->cursor += sizeof(size);
+	card->uid.length = size;
+	if (iter->cursor + size > iter->end) {
+		iter->count = 0;
+		return false;
+	} else if (size > sizeof(card->uid.bytes)) {
+		fprintf(stderr, "Unexpected UID size: %" PRIu8 "\n", size);
+		iter->count = 0;
+		return false;
+	}
+
+	memcpy(card->uid.bytes, iter->cursor, size);
+	iter->cursor += size;
+
+	iter->count--;
+	return true;
+}
+
+static bool NFC_poll(struct NFC* nfc, struct NFCCardIterator* iter)
+{
+	// Don't poll too fast.
+	sleep_ns(150000000);
+	uint8_t const cmd = 0x42;
+	if (!NFC_cmd_send_(nfc, cmd, NULL, 0)) {
+		fprintf(stderr, "Failed to send NFC poll command.\n");
+		return false;
+	}
+	size_t size;
+	if (!NFC_response_recv_(nfc->serial, iter->bytes, &size)) {
+		fprintf(stderr, "Failed to receive NFC poll response.\n");
+		return false;
+	}
+	iter->cursor = iter->bytes;
+	iter->end = iter->bytes + size;
+	memcpy(&iter->count, iter->cursor, sizeof(iter->count));
+	iter->cursor += sizeof(iter->count);
+	if (iter->cursor >= iter->end) {
+		iter->count = 0;
+	}
+	return true;
+}
+
+static bool timeout_(uint64_t start_ns, int seconds_to_wait)
+{
+	if (seconds_to_wait <= 0) {
+		// Wait forever...
+		return false;
+	}
+	uint64_t const ns_per_second = UINT64_C(1000000000);
+	uint64_t const ns_to_wait = (uint64_t)seconds_to_wait * ns_per_second;
+	uint64_t const end_ns = start_ns + ns_to_wait;
+
+	return now_ns() >= end_ns;
+}
+
+static int run_tool_nfc(int argc, char** argv)
+{
+	struct ArgsNFC args;
+	if (!ArgsNFC_parse(&args, argc, argv)) {
+		print_usage_nfc();
+		return 1;
+	}
+
+	struct SerialOptions options = {};
+	struct OptionalSerial maybe_serial = Serial_open(args.port, &options);
+	if (!maybe_serial.has_value) {
+		fprintf(stderr, "Failed to open NFC serial connection.\n");
+		return false;
+	}
+	struct NFC nfc = {
+		.serial = maybe_serial.serial,
+	};
+	// If we've already initialized the NFC device once before then the status will return an error
+	// so we just ignore it.
+	(void)NFC_reset(&nfc);
+
+	if (args.color.has_value) {
+		if (!NFC_led_get_info(&nfc)) {
+			fprintf(stderr, "Failed to get NFC LED info.\n");
+			return false;
+		}
+		if (!NFC_led_set_color(&nfc, args.color.color)) {
+			fprintf(stderr, "Failed to set NFC LED color.\n");
+			return false;
+		}
+	}
+
+	if (args.wait_for_any > 0 || args.wait_for_specific.has_value) {
+		struct UID* seen_uids = NULL;
+		int seen_uid_count = 0;
+		if (args.wait_for_any) {
+			seen_uids = malloc(args.wait_for_any * sizeof(seen_uids[0]));
+			assert(seen_uids);
+		}
+
+		if (!NFC_radio_on(&nfc, kNFCCardType_MIFARE)) {
+			free(seen_uids);
+			fprintf(stderr, "Failed to turn on NFC radio.\n");
+			return false;
+		}
+		// Give the radio half a second to get started.
+		sleep_ns(INT64_C(500000000));
+
+		struct NFCCardIterator iter;
+		struct NFCCard card;
+		uint64_t const start = now_ns();
+		bool did_find_uid = !args.wait_for_specific.has_value;
+		while (seen_uid_count < args.wait_for_any || (!did_find_uid && !timeout_(start, args.timeout))) {
+			if (!NFC_poll(&nfc, &iter)) {
+				free(seen_uids);
+				fprintf(stderr, "Failed to poll NFC.\n");
+				return false;
+			}
+			while (NFCCardIterator_next(&iter, &card)) {
+				if (UID_is_in_array(seen_uids, seen_uid_count, &card.uid)) {
+					continue;
+				}
+
+				if (args.wait_for_any) {
+					memcpy(seen_uids + seen_uid_count, &card.uid, sizeof(card.uid));
+					seen_uid_count++;
+
+					struct UIDString const uid_string = UIDString_from_UID(&card.uid);
+					printf("%s\n", uid_string.chars);
+				}
+				if (args.wait_for_specific.has_value && UID_is_equal(&args.wait_for_specific.uid, &card.uid)) {
+					did_find_uid = true;
+					break;
+				}
+			}
+		}
+		free(seen_uids);
+	}
+
+	Serial_close(nfc.serial);
+	return 0;
+}
+
 static void print_usage(void)
 {
-	fprintf(stderr, "pras3 <led|nfc|vfd|test> [options...]\n");
+	fprintf(stderr, "pras3 <led|nfc|vfd> [options...]\n");
 	print_usage_led();
+	print_usage_nfc();
 }
 
 static int run_test(void)
 {
 	Color_test();
+	UID_test();
 	return 0;
 }
 
@@ -621,6 +1223,8 @@ int main(int argc, char* argv[])
 		return run_test();
 	} else if (0 == strcmp(tool, "led")) {
 		return run_tool_led(argc, argv);
+	} else if (0 == strcmp(tool, "nfc")) {
+		return run_tool_nfc(argc, argv);
 	}
 
 	fprintf(stderr, "Unknown tool name '%s'\n", tool);
