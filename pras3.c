@@ -23,6 +23,18 @@
 #	include <termios.h>
 #endif
 
+#ifdef __APPLE__
+#	define IS_MACOS 1
+#else
+#	define IS_MACOS 0
+#endif
+
+#ifdef __linux__
+#	define IS_LINUX 1
+#else
+#	define IS_LINUX 0
+#endif
+
 #if IS_WINDOWS
 typedef HANDLE Serial;
 #else
@@ -133,6 +145,10 @@ bool Serial_write(Serial serial, uint8_t const* buff, size_t size)
 
 #else
 
+#if IS_MACOS
+#	define CMSPAR 0
+#endif
+
 static struct termios set_termios(struct termios tty, struct SerialOptions const* options)
 {
 	speed_t const speed = B115200;
@@ -142,7 +158,9 @@ static struct termios set_termios(struct termios tty, struct SerialOptions const
 	tty.c_oflag &= ~(OPOST | ONLCR | OCRNL);
 	tty.c_iflag &= ~(INLCR | IGNCR | ICRNL | IGNBRK);
 
+#	if IS_LINUX
 	tty.c_iflag &= ~IUCLC;
+#	endif
 	tty.c_iflag &= ~PARMRK;
 
 	tty.c_ispeed = tty.c_ospeed = speed;
