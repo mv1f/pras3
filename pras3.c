@@ -927,14 +927,14 @@ static bool NFC_cmd_send_(struct NFC* nfc, uint8_t cmd_id, void const* buff, siz
 	checksum = jvs_checksum(buff, size, checksum);
 
 	uint8_t encoded_buff[2 * (sizeof(header) + 255 + sizeof(checksum))];
-	size_t encoded_size;
 
 	encoded_buff[0] = 0xe0;
-	encoded_size = 1;
-	encoded_size += jvs_encode(&buffer_length, sizeof(buffer_length), encoded_buff + encoded_size);
-	encoded_size += jvs_encode(&header, sizeof(header), encoded_buff + encoded_size);
-	encoded_size += jvs_encode(buff, size, encoded_buff + encoded_size);
-	encoded_size += jvs_encode(&checksum, sizeof(checksum), encoded_buff + encoded_size);
+	uint8_t* cursor = encoded_buff + 1;
+	cursor += jvs_encode(&buffer_length, sizeof(buffer_length), cursor);
+	cursor += jvs_encode(&header, sizeof(header), cursor);
+	cursor += jvs_encode(buff, size, cursor);
+	cursor += jvs_encode(&checksum, sizeof(checksum), cursor);
+	size_t encoded_size = cursor - encoded_buff;
 
 	if (!Serial_write(nfc->serial, encoded_buff, encoded_size)) {
 		fprintf(stderr, "Failed to write NFC command to serial\n");
