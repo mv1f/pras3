@@ -19,7 +19,25 @@ test: $(BUILD)/pras3
 $(BUILD):
 	mkdir -p $@
 
-$(BUILD)/pras3: pras3.c | $(BUILD)
+BIG5.TXT:
+	curl -O https://unicode.org/Public/MAPPINGS/OBSOLETE/EASTASIA/OTHER/BIG5.TXT
+
+CP949.TXT:
+	curl -O https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP949.TXT
+
+GB2312.TXT:
+	curl -O https://people.freebsd.org/~perky/i18n/GB2312.TXT
+
+JIS0208.TXT:
+	curl -O http://www.unicode.org/Public/MAPPINGS/OBSOLETE/EASTASIA/JIS/JIS0208.TXT
+
+JIS0212.TXT:
+	curl -O http://www.unicode.org/Public/MAPPINGS/OBSOLETE/EASTASIA/JIS/JIS0212.TXT
+
+enc.c enc.h: enc.py BIG5.TXT CP949.TXT GB2312.TXT JIS0208.TXT JIS0212.TXT
+	python3 enc.py
+
+$(BUILD)/pras3: pras3.c enc.c enc.h | $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@
 
 $(BUILD)/pras3_linux: pras3.c | $(BUILD)
