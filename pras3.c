@@ -151,14 +151,14 @@ void Serial_close(Serial serial)
 	CloseHandle(serial);
 }
 
-bool Serial_read(Serial serial, uint8_t* buff, size_t size)
+bool Serial_read(Serial serial, void* buff, size_t size)
 {
 	DWORD bytes_read;
 	BOOL success = ReadFile(serial, buff, size, &bytes_read, NULL);
 	return success && (bytes_read == size);
 }
 
-bool Serial_write(Serial serial, uint8_t const* buff, size_t size)
+bool Serial_write(Serial serial, void const* buff, size_t size)
 {
 	assert(size <= SSIZE_MAX);
 	DWORD bytes_written;
@@ -228,7 +228,6 @@ static struct termios set_termios(struct termios tty, struct SerialOptions const
 
 struct OptionalSerial Serial_open(char const* path, struct SerialOptions const* options)
 {
-	// speed_t const speed = B115200;
 	int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (fd < 0) {
 		fprintf(stderr, "Failed to open serial port at '%s' (%d: %s)\n", path, errno, strerror(errno));
@@ -250,14 +249,6 @@ struct OptionalSerial Serial_open(char const* path, struct SerialOptions const* 
 		return (struct OptionalSerial){};
 	}
 
-	if (options->rtscts) {
-		// const int v = TIOCM_RTS;
-		// set
-		// ioctl(fd, TIOCMBIS, &v);
-		// clear
-		// ioctl(fd, TIOCMBIC, &v);
-	}
-
 	if (0 != tcflush(fd, TCIFLUSH)) {
 		close(fd);
 		fprintf(stderr, "Failed to flush input buffer(%d: %s)\n", errno, strerror(errno));
@@ -275,7 +266,7 @@ void Serial_close(Serial serial)
 	close(serial);
 }
 
-bool Serial_read(Serial serial, uint8_t* buff, size_t size)
+bool Serial_read(Serial serial, void* buff, size_t size)
 {
 	// Even though the fd is in blocking mode, serial is special
 	// and can still return early or timeout so we must loop.
@@ -311,7 +302,7 @@ bool Serial_read(Serial serial, uint8_t* buff, size_t size)
 	return true;
 }
 
-bool Serial_write(Serial serial, uint8_t const* buff, size_t size)
+bool Serial_write(Serial serial, void const* buff, size_t size)
 {
 	assert(size <= SSIZE_MAX);
 	int const fd = serial;
@@ -1235,6 +1226,455 @@ static void Encoding_test(void)
 #	undef TEST_ENC
 }
 
+#define kVFDImage_width      160
+#define kVFDImage_height     32
+#define kVFDImage_bytes_high 4
+
+struct VFDImage {
+	uint8_t p[kVFDImage_bytes_high * kVFDImage_width];
+};
+
+bool VFD_reset(Serial serial)
+{
+	uint8_t const cmd[] = {0x1b, 0x0b};
+	return Serial_write(serial, cmd, sizeof(cmd));
+}
+
+bool VFD_turn_on(Serial serial, bool on)
+{
+	uint8_t const cmd[] = {0x1b, 0x21, on ? 1 : 0};
+	return Serial_write(serial, cmd, sizeof(cmd));
+}
+
+bool VFD_set_brightness(Serial serial, int brightness)
+{
+	assert(brightness >= 0 && brightness <= 4);
+	uint8_t const cmd[] = {0x1b, 0x20, (uint8_t)brightness};
+	return Serial_write(serial, cmd, sizeof(cmd));
+}
+
+static uint16_t u16_be(uint16_t s)
+{
+#if __LITTLE_ENDIAN__
+    uint8_t b[2];
+    memcpy(b, &s, sizeof(s));
+    s = b[0] << 8 | b[1];
+    return s;
+#else
+    return s;
+#endif
+}
+
+bool VFD_set_text_window(Serial serial, uint16_t x_start, uint16_t x_end, uint8_t y)
+{
+	struct {
+		uint8_t header[2];
+		uint16_t x;
+		uint8_t y;
+		uint16_t x_end;
+		uint8_t unused;
+	} __attribute__((__packed__)) cmd = {
+		.header = {0x1b, 0x40},
+		.x = u16_be(x_start),
+		.y = y,
+		.x_end = u16_be(x_end),
+	};
+	return Serial_write(serial, &cmd, sizeof(cmd));
+}
+
+bool VFD_write_scroll_text(Serial serial, unsigned char const* text, size_t text_len)
+{
+	if (text_len > 148) {
+		fprintf(stderr, "Encoded text string is too long: %zu > 148.\n", text_len);
+		return false;
+	}
+	uint8_t cmd[148 + 3] = {0x1b, 0x50, (uint8_t)text_len};
+	memcpy(&cmd[3], text, text_len);
+	return Serial_write(serial, cmd, 3 + text_len);
+}
+
+bool VFD_set_text_scroll(Serial serial, bool enable)
+{
+	uint8_t cmd[] = {0x1b, 0};
+	if (enable) {
+		cmd[1] = 0x51;
+	} else {
+		cmd[1] = 0x52;
+	}
+	return Serial_write(serial, cmd, sizeof(cmd));
+}
+
+bool VFD_draw_image(Serial serial, uint16_t x, uint8_t y_byte, uint16_t width, uint8_t bytes_high, struct VFDImage const* image)
+{
+	struct {
+		uint8_t header[2];
+		uint16_t x_start;
+		uint8_t y_start_byte;
+		uint16_t w;
+		uint8_t y_end_byte;
+		struct VFDImage image;
+	} __attribute__((__packed__)) cmd = {
+		.header = {0x1b, 0x2e},
+		.x_start = u16_be(x),
+		.y_start_byte = y_byte,
+		.w = u16_be(width),
+		.y_end_byte = (y_byte + bytes_high) - 1,
+	};
+	memcpy(&cmd.image, image, sizeof(*image));
+	return Serial_write(serial, &cmd, sizeof(cmd));
+}
+
+bool VFD_set_text_encoding(Serial serial, Encoding encoding)
+{
+	uint8_t enc_cmd;
+	switch(encoding) {
+		case kEncoding_shift_jis: enc_cmd = 2; break;
+		case kEncoding_gb2312: enc_cmd = 0; break;
+		case kEncoding_big5: enc_cmd = 1; break;
+		case kEncoding_cp949: enc_cmd = 3; break;
+		default:
+			fprintf(stderr, "Unknown encoding format %d\n", encoding);
+			abort();
+	}
+	uint8_t const cmd[] = {0x1b, 0x32, enc_cmd};
+	return Serial_write(serial, cmd, sizeof(cmd));
+}
+
+struct ArgsVFD {
+	char const* port;
+	int brightness;
+	char const* image_path;
+	unsigned char* text;
+	int text_length;
+	Encoding text_encoding;
+	bool off;
+	bool reset;
+};
+
+void ArgsVFD_cleanup(struct ArgsVFD* args)
+{
+	free(args->text);
+}
+
+
+#if IS_WINDOWS
+#include <wchar.h>
+static wchar_t* copy_unicode_arg_(char** argv, int arg_i, size_t* unicode_len)
+{
+	// On windows the args we get are non-unicode so we ignore them and just ask the OS directly.
+	(void)argv;
+	LPWSTR wide_commandline = GetCommandLineW();
+	int argc_w;
+	LPWSTR* argv_w = CommandLineToArgvW(wide_commandline, &argc_w);
+	assert(argv_w);
+	assert(argc_w > arg_i);
+	LPWSTR arg = argv_w[arg_i];
+	*unicode_len = wcslen(arg);
+	size_t buff_size = sizeof(wchar_t) * (*unicode_len + 1);
+	wchar_t* result = malloc(buff_size);
+	memcpy(result, arg, buff_size);
+	LocalFree(argv_w);
+
+	return result;
+}
+
+static void free_unicode_arg_(wchar_t* arg)
+{
+	free(arg);
+}
+
+#else
+
+#include <wchar.h>
+#include <locale.h>
+static wchar_t* copy_unicode_arg_(char** argv, int arg_i, size_t* unicode_len)
+{
+	char* old_locale = setlocale(LC_ALL, NULL);
+	char* locale_result = setlocale(LC_ALL, "");
+	if (locale_result == NULL) {
+		setlocale(LC_ALL, old_locale);
+		return NULL;
+	}
+
+	wchar_t* arg_wide = NULL;
+	mbstate_t ps = {};
+	char const* arg_in = argv[arg_i];
+	size_t const arg_in_len = strlen(arg_in);
+	arg_wide = malloc(sizeof(arg_wide[0]) * (arg_in_len + 1));
+	assert(arg_wide);
+	size_t const wide_len = mbsrtowcs(arg_wide, &arg_in, arg_in_len, &ps);
+	assert(wide_len != (size_t)-1);
+
+	setlocale(LC_ALL, old_locale);
+
+	*unicode_len = wide_len;
+	return arg_wide;
+}
+
+static void free_unicode_arg_(wchar_t* arg)
+{
+	free(arg);
+}
+
+#endif
+
+static int find_string_encoding_(wchar_t const* uni_str, size_t uni_str_len, Encoding* out_encoding)
+{
+	assert(uni_str);
+	assert(out_encoding);
+	Encoding all_encodings[] = {
+		kEncoding_shift_jis,
+		kEncoding_big5,
+		kEncoding_gb2312,
+		kEncoding_cp949,
+	};
+	for (size_t i = 0; i < sizeof(all_encodings) / sizeof(all_encodings[0]); i++) {
+		Encoding const encoding = all_encodings[i];
+		int len = encode_string(uni_str, uni_str_len, encoding, NULL);
+		if (len != -1) {
+			*out_encoding = encoding;
+			return len;
+		}
+	}
+	return -1;
+}
+
+static bool bmp_load_(char const* path, struct VFDImage* vfd_image)
+{
+	FILE* f = fopen(path, "rb");
+	if (f == NULL) {
+		fprintf(stderr, "failed to open image '%s'.\n", path);
+		return false;
+	}
+	ssize_t bytes_read;
+
+	struct BMPHeader {
+		char magic[2];
+		uint32_t size;
+		uint32_t pad_;
+		uint32_t image_data_offset;
+		struct {
+			uint32_t size;
+			int32_t width;
+			int32_t height;
+			uint16_t planes;
+			uint16_t bpp;
+			uint32_t compression;
+			uint32_t image_size;
+			uint32_t horizontal_resolution;
+			uint32_t vertical_resolution;
+			uint32_t colors_in_palette;
+			uint32_t important_colors;
+		} bitmap_info;
+	} __attribute__((__packed__));
+
+	struct BMPHeader header;
+	bytes_read = fread(&header, 1, sizeof(header), f);
+	if (bytes_read != sizeof(header)) {
+		fprintf(stderr, "faild to read BMP header.\n");
+		return false;
+	}
+	size_t const bytes_per_pixel = header.bitmap_info.bpp / 8;
+	int const row_size = 4 * ((header.bitmap_info.width * bytes_per_pixel + 3) / 4);
+
+	int const w = header.bitmap_info.width;
+	int const h = header.bitmap_info.height < 0 ? -header.bitmap_info.height : header.bitmap_info.height;
+	if (w != kVFDImage_width || h != kVFDImage_height) {
+		fclose(f);
+		fprintf(stderr, "Image is %d x %d but it must be %d x %d\n", w, h, kVFDImage_width, kVFDImage_height);
+		return false;
+	}
+	size_t const total_image_bytes = row_size * h;
+	// Seek to the image bytes.
+	{
+		int err = fseek(f, header.image_data_offset, SEEK_SET);
+		assert(err == 0);
+	}
+	uint8_t* image_bytes = malloc(total_image_bytes);
+	assert(image_bytes);
+	bytes_read = fread(image_bytes, 1, total_image_bytes, f);
+	if (bytes_read != (ssize_t)total_image_bytes) {
+		fclose(f);
+		fprintf(stderr, "Faild to read %zu image bytes.\n", total_image_bytes);
+		return false;
+	}
+
+	memset(vfd_image->p, 0, sizeof(vfd_image->p));
+	uint8_t const* row = image_bytes;
+	int stride;
+	if (header.bitmap_info.height < 0) {
+		stride = row_size;
+		row = image_bytes;
+	} else {
+		stride = -row_size;
+		row = image_bytes + row_size * (h - 1);
+	}
+	uint8_t const* p;
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			p = row + x * bytes_per_pixel;
+			size_t const r = (size_t)p[0] * (size_t)212;
+			size_t const g = (size_t)p[1] * (size_t)701;
+			size_t const b = (size_t)p[2] * (size_t)87;
+			uint8_t const brightness = (r + g + b) / (size_t)1000;
+			uint8_t v = brightness > 128 ? 1 : 0;
+			size_t const col_byte_index = y / 8;
+			size_t const bit_index = y % 8;
+			v <<= (7 - bit_index);
+			vfd_image->p[x * kVFDImage_bytes_high + col_byte_index] |= v;
+		}
+		row += stride;
+	}
+
+	free(image_bytes);
+	fclose(f);
+	return true;
+}
+
+static void print_usage_vfd(void)
+{
+	fprintf(stderr, "\n");
+	fprintf(stderr, "pras3 vfd [--port path] [--text <string>] [--image <path>] [--brightness <0-4>] [--off] [--reset]\n");
+	fprintf(stderr, "--port <path>         The serial port path.\n");
+	fprintf(stderr, "--text <string>       String to scroll on the display.\n");
+	fprintf(stderr, "--image <path>        Path to an RGB BMP image to display on the VFD.\n");
+	fprintf(stderr, "                      The image must be exactly 160x32 pixels.\n");
+	fprintf(stderr, "--brightness <0-4>    Set the brightness of the VFD. 0 is off. 4 is the max brightest.\n");
+	fprintf(stderr, "--off                 Turn off the VFD.\n");
+	fprintf(stderr, "--reset               Reset VFD to initial state.\n");
+}
+
+static bool ArgsVFD_parse(struct ArgsVFD* args, int argc, char** argv)
+{
+	*args = (struct ArgsVFD){
+		.brightness = -1,
+	};
+	if (IS_WINDOWS) {
+		args->port = "COM1";
+	} else {
+		args->port = "/dev/ttyS0";
+	}
+	struct option const longopts[] = {
+		{"port",       required_argument, NULL, 'p'},
+		{"text",       required_argument, NULL, 't'},
+		{"image",      required_argument, NULL, 'i'},
+		{"brightness", required_argument, NULL, 'b'},
+		{"off",        no_argument,       NULL, 'o'},
+		{"reset",      no_argument,       NULL, 'r'},
+		{},
+	};
+	int c;
+	optind = 1;
+	while (-1 != (c = getopt_long(argc, argv, "", longopts, NULL))) {
+		switch (c) {
+			case 'p': {
+				args->port = optarg;
+			} break;
+			case 't': {
+				size_t unicode_length;
+				wchar_t* unicode_arg = copy_unicode_arg_(argv, optind - 1, &unicode_length);
+				if (unicode_arg == NULL) {
+					fprintf(stderr, "Could not copy text argument. Something bad has happend.\n");
+					return false;
+				}
+				args->text_length = find_string_encoding_(unicode_arg, unicode_length, &args->text_encoding);
+				if (args->text_length == -1) {
+					fprintf(stderr, "Could not encode text string.\n");
+					free_unicode_arg_(unicode_arg);
+					return false;
+				}
+				args->text = malloc(args->text_length + 1);
+				encode_string(unicode_arg, unicode_length, args->text_encoding, args->text);
+				args->text[args->text_length] = '\0';
+				free_unicode_arg_(unicode_arg);
+			} break;
+			case 'i': {
+				args->image_path = optarg;
+			} break;
+			case 'b': {
+				char* end;
+				args->brightness = strtol(optarg, &end, 10);
+				if (errno != 0 || end == optarg) {
+					fprintf(stderr, "Invalid value for brightness. Only 0-4 are valid values.\n");
+					return false;
+				}
+			} break;
+			case 'o': {
+				args->off = true;
+			} break;
+			case 'r': {
+				args->reset = true;
+			} break;
+			default: {
+				fprintf(stderr, "Unknown option '%s'\n", argv[optopt]);
+				return false;
+			} break;
+		}
+	}
+
+	return true;
+}
+
+int run_tool_vfd(int argc, char** argv)
+{
+	struct ArgsVFD args;
+	if (!ArgsVFD_parse(&args, argc, argv)) {
+		fprintf(stderr, "Failed to parse VFD args.\n");
+		print_usage_vfd();
+		ArgsVFD_cleanup(&args);
+		return -1;
+	}
+	struct VFDImage image;
+	if (args.image_path) {
+		if (!bmp_load_(args.image_path, &image)) {
+			fprintf(stderr, "Failed to load BMP image.\n");
+			ArgsVFD_cleanup(&args);
+			return -1;
+		}
+	}
+
+	struct SerialOptions const options = {
+		.rtscts = true,
+	};
+	struct OptionalSerial maybe_serial = Serial_open(args.port, &options);
+	if (!maybe_serial.has_value) {
+		fprintf(stderr, "Failed to open VFD serial connection.\n");
+		return false;
+	}
+	Serial serial = maybe_serial.serial;
+
+	if (args.reset) {
+		if (!VFD_reset(serial)) {
+			fprintf(stderr, "Failed to reset VFD.\n");
+			return false;
+		}
+	}
+	if (!VFD_turn_on(serial, !args.off)) {
+		fprintf(stderr, "Failed to turn VFD %s.\n", args.off ? "off" : "on");
+		return false;
+	}
+	if (args.text) {
+		if (args.text_length > 0) {
+			VFD_set_text_window(serial, 20, 120, 1);
+			VFD_set_text_encoding(serial, args.text_encoding);
+			VFD_write_scroll_text(serial, args.text, args.text_length);
+			VFD_set_text_scroll(serial, true);
+		} else {
+			VFD_set_text_scroll(serial, false);
+		}
+	}
+	if (args.image_path) {
+		VFD_draw_image(serial, 0, 0, kVFDImage_width, kVFDImage_bytes_high, &image);
+	}
+	if (args.brightness != -1) {
+		VFD_set_brightness(serial, args.brightness);
+	}
+
+	Serial_close(serial);
+	ArgsVFD_cleanup(&args);
+	return 0;
+}
+
 static int run_test(void)
 {
 	Color_test();
@@ -1249,6 +1689,7 @@ static void print_usage(void)
 	fprintf(stderr, "pras3 <led|nfc|vfd> [options...]\n");
 	print_usage_led();
 	print_usage_nfc();
+	print_usage_vfd();
 }
 
 int main(int argc, char* argv[])
@@ -1265,6 +1706,8 @@ int main(int argc, char* argv[])
 		return run_tool_led(argc, argv);
 	} else if (0 == strcmp(tool, "nfc")) {
 		return run_tool_nfc(argc, argv);
+	} else if (0 == strcmp(tool, "vfd")) {
+		return run_tool_vfd(argc, argv);
 	}
 
 	fprintf(stderr, "Unknown tool name '%s'\n", tool);
