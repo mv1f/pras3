@@ -10,6 +10,8 @@ linux: $(BUILD)/pras3_linux
 
 windows: $(BUILD)/pras3.exe
 
+archive: $(BUILD)/pras3_linux.zip $(BUILD)/pras3_windows.zip
+
 clean:
 	rm -rf $(BUILD)
 
@@ -45,3 +47,9 @@ $(BUILD)/pras3_linux: pras3.c | $(BUILD)
 
 $(BUILD)/pras3.exe: pras3.c | $(BUILD)
 	zig cc -target x86_64-windows-gnu $(CFLAGS) $< -o $@
+
+$(BUILD)/pras3_linux.zip: $(BUILD)/pras3_linux
+	cd $(BUILD); mv pras3_linux /tmp/pras3; pushd /tmp; zip pras3_linux.zip pras3; popd; mv /tmp/pras3_linux.zip .
+
+$(BUILD)/pras3_windows.zip: $(BUILD)/pras3.exe
+	cd $(BUILD); zip pras3_windows.zip pras3.exe

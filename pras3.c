@@ -1304,6 +1304,12 @@ bool VFD_set_text_scroll(Serial serial, bool enable)
 	return Serial_write(serial, cmd, sizeof(cmd));
 }
 
+bool VFD_set_slow_text_scroll(Serial serial, bool enable)
+{
+	uint8_t const cmd[] = {0x1b, 0x41, enable ? 1 : 0};
+	return Serial_write(serial, cmd, sizeof(cmd));
+}
+
 bool VFD_draw_image(Serial serial, uint16_t x, uint8_t y_byte, uint16_t width, uint8_t bytes_high, struct VFDImage const* image)
 {
 	struct {
@@ -1346,6 +1352,7 @@ struct ArgsVFD {
 	char const* image_path;
 	unsigned char* text;
 	int text_length;
+	int slow_scroll;
 	Encoding text_encoding;
 	bool off;
 	bool reset;
@@ -1537,6 +1544,7 @@ static void print_usage_vfd(void)
 	fprintf(stderr, "pras3 vfd [--port path] [--text <string>] [--image <path>] [--brightness <0-4>] [--off] [--reset]\n");
 	fprintf(stderr, "--port <path>         The serial port path.\n");
 	fprintf(stderr, "--text <string>       String to scroll on the display.\n");
+	fprintf(stderr, "--slow_scroll <0,1>   Set to 1 to make the text scroll slower.\n");
 	fprintf(stderr, "--image <path>        Path to an RGB BMP image to display on the VFD.\n");
 	fprintf(stderr, "                      The image must be exactly 160x32 pixels.\n");
 	fprintf(stderr, "--brightness <0-4>    Set the brightness of the VFD. 0 is off. 4 is the max brightest.\n");
@@ -1548,6 +1556,7 @@ static bool ArgsVFD_parse(struct ArgsVFD* args, int argc, char** argv)
 {
 	*args = (struct ArgsVFD){
 		.brightness = -1,
+		.slow_scroll = -1,
 	};
 	if (IS_WINDOWS) {
 		args->port = "COM1";
@@ -1555,12 +1564,13 @@ static bool ArgsVFD_parse(struct ArgsVFD* args, int argc, char** argv)
 		args->port = "/dev/ttyS0";
 	}
 	struct option const longopts[] = {
-		{"port",       required_argument, NULL, 'p'},
-		{"text",       required_argument, NULL, 't'},
-		{"image",      required_argument, NULL, 'i'},
-		{"brightness", required_argument, NULL, 'b'},
-		{"off",        no_argument,       NULL, 'o'},
-		{"reset",      no_argument,       NULL, 'r'},
+		{"port",        required_argument, NULL, 'p'},
+		{"text",        required_argument, NULL, 't'},
+		{"slow_scroll", required_argument, NULL, 's'},
+		{"image",       required_argument, NULL, 'i'},
+		{"brightness",  required_argument, NULL, 'b'},
+		{"off",         no_argument,       NULL, 'o'},
+		{"reset",       no_argument,       NULL, 'r'},
 		{},
 	};
 	int c;
@@ -1587,6 +1597,14 @@ static bool ArgsVFD_parse(struct ArgsVFD* args, int argc, char** argv)
 				encode_string(unicode_arg, unicode_length, args->text_encoding, args->text);
 				args->text[args->text_length] = '\0';
 				free_unicode_arg_(unicode_arg);
+			} break;
+			case 's': {
+				char* end;
+				args->slow_scroll = strtol(optarg, &end, 10);
+				if (errno != 0 || end == optarg) {
+					fprintf(stderr, "Invalid value for slow_scroll. Only 0 or 1 is allowed.\n");
+					return false;
+				}
 			} break;
 			case 'i': {
 				args->image_path = optarg;
@@ -1652,6 +1670,12 @@ int run_tool_vfd(int argc, char** argv)
 	if (!VFD_turn_on(serial, !args.off)) {
 		fprintf(stderr, "Failed to turn VFD %s.\n", args.off ? "off" : "on");
 		return false;
+	}
+	if (args.slow_scroll != -1) {
+		if (!VFD_set_slow_text_scroll(serial, args.slow_scroll ? true : false)) {
+			fprintf(stderr, "Failed to set slow text scroll.\n");
+			return false;
+		}
 	}
 	if (args.text) {
 		if (args.text_length > 0) {
