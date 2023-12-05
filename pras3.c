@@ -1446,7 +1446,11 @@ static int find_string_encoding_(wchar_t const* uni_str, size_t uni_str_len, Enc
 	return -1;
 }
 
-static bool bmp_load_(char const* path, struct VFDImage* vfd_image)
+#define BMP_MAX_IMAGE_BYTES(w,h) ((w)*(h)*4)
+#define BMP_BYTES_PER_PIXEL 3
+#define BMP_ROW_STRIDE(w) (4 * (((w) * BMP_BYTES_PER_PIXEL + (4 - 1)) / 4))
+
+static bool bmp_load_(char const* path, int expected_w, int expected_h, void* image_bytes)
 {
 	FILE* f = fopen(path, "rb");
 	if (f == NULL) {
@@ -1481,12 +1485,16 @@ static bool bmp_load_(char const* path, struct VFDImage* vfd_image)
 		fprintf(stderr, "faild to read BMP header.\n");
 		return false;
 	}
-	size_t const bytes_per_pixel = header.bitmap_info.bpp / 8;
-	int const row_size = 4 * ((header.bitmap_info.width * bytes_per_pixel + 3) / 4);
+	if (header.bitmap_info.bpp != 24) {
+		fclose(f);
+		fprintf(stderr, "BMP is %" PRIu16 " bpp but only RGB (24bpp) images are supported.\n", header.bitmap_info.bpp);
+		return false;
+	}
+	int const row_size = BMP_ROW_STRIDE(header.bitmap_info.width);
 
 	int const w = header.bitmap_info.width;
 	int const h = header.bitmap_info.height < 0 ? -header.bitmap_info.height : header.bitmap_info.height;
-	if (w != kVFDImage_width || h != kVFDImage_height) {
+	if (w != expected_w || h != expected_h) {
 		fclose(f);
 		fprintf(stderr, "Image is %d x %d but it must be %d x %d\n", w, h, kVFDImage_width, kVFDImage_height);
 		return false;
@@ -1497,29 +1505,49 @@ static bool bmp_load_(char const* path, struct VFDImage* vfd_image)
 		int err = fseek(f, header.image_data_offset, SEEK_SET);
 		assert(err == 0);
 	}
-	uint8_t* image_bytes = malloc(total_image_bytes);
+	if (header.bitmap_info.height < 0) {
+		// If the height is negative, the rows are already in the expected order.
+		bytes_read = fread(image_bytes, 1, total_image_bytes, f);
+		if (bytes_read != (ssize_t)total_image_bytes) {
+			fclose(f);
+			fprintf(stderr, "Faild to read %zu image bytes.\n", total_image_bytes);
+			return false;
+		}
+	} else {
+		// If the height is positive we need to flip the rows.
+		uint8_t* row = image_bytes + row_size * (h - 1);
+		for (int row_i = 0; row_i < h; row_i++) {
+			bytes_read = fread(row, 1, row_size, f);
+			if (bytes_read != (ssize_t)total_image_bytes) {
+				fclose(f);
+				fprintf(stderr, "Faild to read %zu image bytes from row %d.\n", total_image_bytes, row_i);
+				return false;
+			}
+			row -= row_size;
+		}
+	}
+
+	fclose(f);
+	return true;
+}
+
+static bool VFDImage_load_(struct VFDImage* vfd_image, char const* path)
+{
+	void* image_bytes = malloc(BMP_MAX_IMAGE_BYTES(kVFDImage_width, kVFDImage_height));
 	assert(image_bytes);
-	bytes_read = fread(image_bytes, 1, total_image_bytes, f);
-	if (bytes_read != (ssize_t)total_image_bytes) {
-		fclose(f);
-		fprintf(stderr, "Faild to read %zu image bytes.\n", total_image_bytes);
+	if (!bmp_load_(path, kVFDImage_width, kVFDImage_height, image_bytes)) {
+		free(image_bytes);
+		fprintf(stderr, "Failed to load VFD BMP.\n");
 		return false;
 	}
 
+	// Convert BMP image bytes to the VFD format.
 	memset(vfd_image->p, 0, sizeof(vfd_image->p));
 	uint8_t const* row = image_bytes;
-	int stride;
-	if (header.bitmap_info.height < 0) {
-		stride = row_size;
-		row = image_bytes;
-	} else {
-		stride = -row_size;
-		row = image_bytes + row_size * (h - 1);
-	}
-	uint8_t const* p;
-	for (int y = 0; y < h; y++) {
-		for (int x = 0; x < w; x++) {
-			p = row + x * bytes_per_pixel;
+	int stride = BMP_ROW_STRIDE(kVFDImage_width);
+	for (int y = 0; y < kVFDImage_height; y++) {
+		for (int x = 0; x < kVFDImage_width; x++) {
+			uint8_t const* p = row + x * BMP_BYTES_PER_PIXEL;
 			size_t const r = (size_t)p[0] * (size_t)212;
 			size_t const g = (size_t)p[1] * (size_t)701;
 			size_t const b = (size_t)p[2] * (size_t)87;
@@ -1534,7 +1562,6 @@ static bool bmp_load_(char const* path, struct VFDImage* vfd_image)
 	}
 
 	free(image_bytes);
-	fclose(f);
 	return true;
 }
 
@@ -1644,7 +1671,7 @@ int run_tool_vfd(int argc, char** argv)
 	}
 	struct VFDImage image;
 	if (args.image_path) {
-		if (!bmp_load_(args.image_path, &image)) {
+		if (!VFDImage_load_(&image, args.image_path)) {
 			fprintf(stderr, "Failed to load BMP image.\n");
 			ArgsVFD_cleanup(&args);
 			return -1;
