@@ -469,12 +469,101 @@ static void Color_test(void)
 	assert(c.has_value && c.color.r == 0xff && c.color.g == 0xff && c.color.b == 0xff);
 }
 
+#define BMP_MAX_IMAGE_BYTES(w,h) ((w)*(h)*4)
+#define BMP_BYTES_PER_PIXEL 3
+#define BMP_ROW_STRIDE(w,bpp) (4 * (((w) * ((bpp)/8) + (4 - 1)) / 4))
+
+static bool bmp_load_(char const* path, int expected_w, int expected_h, void* image_bytes, uint16_t* bpp)
+{
+	assert(image_bytes);
+	assert(bpp);
+	FILE* f = fopen(path, "rb");
+	if (f == NULL) {
+		fprintf(stderr, "failed to open image '%s'.\n", path);
+		return false;
+	}
+	ssize_t bytes_read;
+
+	struct BMPHeader {
+		char magic[2];
+		uint32_t size;
+		uint32_t pad_;
+		uint32_t image_data_offset;
+		struct {
+			uint32_t size;
+			int32_t width;
+			int32_t height;
+			uint16_t planes;
+			uint16_t bpp;
+			uint32_t compression;
+			uint32_t image_size;
+			uint32_t horizontal_resolution;
+			uint32_t vertical_resolution;
+			uint32_t colors_in_palette;
+			uint32_t important_colors;
+		} bitmap_info;
+	} __attribute__((__packed__));
+
+	struct BMPHeader header;
+	bytes_read = fread(&header, 1, sizeof(header), f);
+	if (bytes_read != sizeof(header)) {
+		fprintf(stderr, "faild to read BMP header.\n");
+		return false;
+	}
+	if (header.bitmap_info.bpp != 24 && header.bitmap_info.bpp != 32) {
+		fclose(f);
+		fprintf(stderr, "BMP is %" PRIu16 " bpp but only RGB (24bpp) and ARGB (32bpp) images are supported.\n", header.bitmap_info.bpp);
+		return false;
+	}
+	*bpp = header.bitmap_info.bpp;
+	int const row_size = BMP_ROW_STRIDE(header.bitmap_info.width, header.bitmap_info.bpp);
+
+	int const w = header.bitmap_info.width;
+	int const h = header.bitmap_info.height < 0 ? -header.bitmap_info.height : header.bitmap_info.height;
+	if (w != expected_w || h != expected_h) {
+		fclose(f);
+		fprintf(stderr, "Image is %d x %d but it must be %d x %d\n", w, h, expected_w, expected_h);
+		return false;
+	}
+	size_t const total_image_bytes = row_size * h;
+	// Seek to the image bytes.
+	{
+		int err = fseek(f, header.image_data_offset, SEEK_SET);
+		assert(err == 0);
+	}
+	if (header.bitmap_info.height < 0) {
+		// If the height is negative, the rows are already in the expected order.
+		bytes_read = fread(image_bytes, 1, total_image_bytes, f);
+		if (bytes_read != (ssize_t)total_image_bytes) {
+			fclose(f);
+			fprintf(stderr, "Faild to read %zu image bytes.\n", total_image_bytes);
+			return false;
+		}
+	} else {
+		// If the height is positive we need to flip the rows.
+		uint8_t* row = image_bytes + row_size * (h - 1);
+		for (int row_i = 0; row_i < h; row_i++) {
+			bytes_read = fread(row, 1, row_size, f);
+			if (bytes_read != (ssize_t)total_image_bytes) {
+				fclose(f);
+				fprintf(stderr, "Faild to read %zu image bytes from row %d.\n", total_image_bytes, row_i);
+				return false;
+			}
+			row -= row_size;
+		}
+	}
+
+	fclose(f);
+	return true;
+}
+
 struct ArgsLED
 {
 	char const* port;
 	struct Color left;
 	struct Color right;
 	struct Color center;
+	char const* image_path;
 };
 
 static bool ArgsLED_parse(struct ArgsLED* args, int argc, char** argv)
@@ -491,6 +580,7 @@ static bool ArgsLED_parse(struct ArgsLED* args, int argc, char** argv)
 		{"left",   required_argument, NULL, '<'},
 		{"right",  required_argument, NULL, '>'},
 		{"center", required_argument, NULL, '^'},
+		{"image",  required_argument, NULL, 'i'},
 		{},
 	};
 	struct OptionalColor maybe_color = {};
@@ -532,10 +622,31 @@ static bool ArgsLED_parse(struct ArgsLED* args, int argc, char** argv)
 					return false;
 				}
 			} break;
+			case 'i': {
+				args->image_path = optarg;
+			} break;
 			default: {
 				fprintf(stderr, "Unknown option '%s'\n", argv[optopt]);
 				return false;
 			} break;
+		}
+	}
+	if (args->image_path) {
+		if (maybe_color.has_value) {
+			fprintf(stderr, "You can't use --color with --image.\n");
+			return false;
+		}
+		if (maybe_left.has_value) {
+			fprintf(stderr, "You can't use --left with --image.\n");
+			return false;
+		}
+		if (maybe_right.has_value) {
+			fprintf(stderr, "You can't use --right with --image.\n");
+			return false;
+		}
+		if (maybe_center.has_value) {
+			fprintf(stderr, "You can't use --center with --image.\n");
+			return false;
 		}
 	}
 	// Use the main color value to set the sections if they weren't given a value explicitly.
@@ -550,9 +661,11 @@ static bool ArgsLED_parse(struct ArgsLED* args, int argc, char** argv)
 			maybe_center = maybe_color;
 		}
 	}
-	if (!maybe_left.has_value || !maybe_right.has_value || !maybe_center.has_value) {
-		fprintf(stderr, "colors for all sides not specified. use '--color' to give a default\n");
-		return false;
+	if (args->image_path == NULL) {
+		if (!maybe_left.has_value || !maybe_right.has_value || !maybe_center.has_value) {
+			fprintf(stderr, "colors for all sides not specified. use '--color' to give a default\n");
+			return false;
+		}
 	}
 	args->left = maybe_left.color;
 	args->right = maybe_right.color;
@@ -569,27 +682,67 @@ static void print_usage_led(void)
 	fprintf(stderr, "--left <0-255,0-255,0-255>     The color to set the left side LEDs to.\n");
 	fprintf(stderr, "--right <0-255,0-255,0-255>    The color to set the right side LEDs to.\n");
 	fprintf(stderr, "--center <0-255,0-255,0-255>   The color to set the right side LEDs to.\n");
+	fprintf(stderr, "--image <path>                 Path to a 22 x 1 RGB BMP image to set pixel colors with.\n");
 }
 
 struct LEDPage {
 	struct Color pixels[22];
 };
 
+struct LEDImage {
+	uint8_t p[22 * 3];
+};
+
+static bool LEDImage_load_(struct LEDImage* image, char const* path)
+{
+	uint16_t bpp;
+	uint8_t image_bytes[22 * 4] = {};
+	if (!bmp_load_(path, 22, 1, image_bytes, &bpp)) {
+		fprintf(stderr, "failed to load bmp for LEDs.\n");
+		return false;
+	}
+	// Convert to the format we expect.
+	if (bpp == 24 || bpp == 32) {
+		uint16_t bytes_per_pixel = bpp / 8;
+		for (size_t i = 0; i < 22; i++) {
+			uint8_t* from_p = &image_bytes[i * bytes_per_pixel];
+			uint8_t* to_p = &image->p[i * 3];
+			// BGR to RGB order.
+			to_p[0] = from_p[2];
+			to_p[1] = from_p[1];
+			to_p[2] = from_p[0];
+		}
+	} else {
+		fprintf(stderr, "Unexpected BPP for LED image: %" PRIu16 "\n", bpp);
+		return false;
+	}
+	return true;
+}
+
+// Maps pixels laied out in order of left-center-right to the in-memory placement.
+static uint8_t const led_location_to_mem[22] = {
+	//  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20  21
+	   16, 17, 18,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 19, 20, 21
+};
+
+void LEDPage_image_set(struct LEDPage* page, struct LEDImage const* image)
+{
+	for (size_t i = 0; i < 22; i++) {
+		uint8_t const* const p = &image->p[i * 3];
+		page->pixels[led_location_to_mem[i]] = (struct Color){ p[0], p[1], p[2] };
+	}
+}
+
 void LEDPage_set(struct LEDPage* page, struct Color left, struct Color center, struct Color right)
 {
-	// Maps pixels laied out in order of left-center-right to the in-memory placement.
-	static const uint8_t location_to_mem[22] = {
-		// 0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16  17  18  19  20  21
-		   3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17, 18,  0,  1,  2, 19, 20, 21,
-	};
 	for (size_t i = 0; i < 6; i++) {
-		page->pixels[location_to_mem[i]] = left;
+		page->pixels[led_location_to_mem[i]] = left;
 	}
-	for (size_t i = 6; i < 6 + 12; i++) {
-		page->pixels[location_to_mem[i]] = center;
+	for (size_t i = 6; i < 6 + 10; i++) {
+		page->pixels[led_location_to_mem[i]] = center;
 	}
-	for (size_t i = 6 + 12; i < 22; i++) {
-		page->pixels[location_to_mem[i]] = right;
+	for (size_t i = 6 + 10; i < 22; i++) {
+		page->pixels[led_location_to_mem[i]] = right;
 	}
 }
 
@@ -659,9 +812,20 @@ static int run_tool_led(int argc, char** argv)
 	}
 	Serial serial = maybe_serial.serial;
 	struct LEDDisplay display;
-	LEDPage_set(&display.pages[0], args.left, args.center, args.right);
-	LEDPage_set(&display.pages[1], args.left, args.center, args.right);
-	LEDPage_set(&display.pages[2], args.left, args.center, args.right);
+	if (args.image_path) {
+		struct LEDImage image;
+		if (!LEDImage_load_(&image, args.image_path)) {
+			fprintf(stderr, "Failed to load LEDImage from '%s'.\n", args.image_path);
+			return 1;
+		}
+		LEDPage_image_set(&display.pages[0], &image);
+		LEDPage_image_set(&display.pages[1], &image);
+		LEDPage_image_set(&display.pages[2], &image);
+	} else {
+		LEDPage_set(&display.pages[0], args.left, args.center, args.right);
+		LEDPage_set(&display.pages[1], args.left, args.center, args.right);
+		LEDPage_set(&display.pages[2], args.left, args.center, args.right);
+	}
 	if (!LED_fade_to_display(serial, &display)) {
 		fprintf(stderr, "Failed to fade to LED display\n");
 		Serial_close(serial);
@@ -1446,96 +1610,12 @@ static int find_string_encoding_(wchar_t const* uni_str, size_t uni_str_len, Enc
 	return -1;
 }
 
-#define BMP_MAX_IMAGE_BYTES(w,h) ((w)*(h)*4)
-#define BMP_BYTES_PER_PIXEL 3
-#define BMP_ROW_STRIDE(w) (4 * (((w) * BMP_BYTES_PER_PIXEL + (4 - 1)) / 4))
-
-static bool bmp_load_(char const* path, int expected_w, int expected_h, void* image_bytes)
-{
-	FILE* f = fopen(path, "rb");
-	if (f == NULL) {
-		fprintf(stderr, "failed to open image '%s'.\n", path);
-		return false;
-	}
-	ssize_t bytes_read;
-
-	struct BMPHeader {
-		char magic[2];
-		uint32_t size;
-		uint32_t pad_;
-		uint32_t image_data_offset;
-		struct {
-			uint32_t size;
-			int32_t width;
-			int32_t height;
-			uint16_t planes;
-			uint16_t bpp;
-			uint32_t compression;
-			uint32_t image_size;
-			uint32_t horizontal_resolution;
-			uint32_t vertical_resolution;
-			uint32_t colors_in_palette;
-			uint32_t important_colors;
-		} bitmap_info;
-	} __attribute__((__packed__));
-
-	struct BMPHeader header;
-	bytes_read = fread(&header, 1, sizeof(header), f);
-	if (bytes_read != sizeof(header)) {
-		fprintf(stderr, "faild to read BMP header.\n");
-		return false;
-	}
-	if (header.bitmap_info.bpp != 24) {
-		fclose(f);
-		fprintf(stderr, "BMP is %" PRIu16 " bpp but only RGB (24bpp) images are supported.\n", header.bitmap_info.bpp);
-		return false;
-	}
-	int const row_size = BMP_ROW_STRIDE(header.bitmap_info.width);
-
-	int const w = header.bitmap_info.width;
-	int const h = header.bitmap_info.height < 0 ? -header.bitmap_info.height : header.bitmap_info.height;
-	if (w != expected_w || h != expected_h) {
-		fclose(f);
-		fprintf(stderr, "Image is %d x %d but it must be %d x %d\n", w, h, kVFDImage_width, kVFDImage_height);
-		return false;
-	}
-	size_t const total_image_bytes = row_size * h;
-	// Seek to the image bytes.
-	{
-		int err = fseek(f, header.image_data_offset, SEEK_SET);
-		assert(err == 0);
-	}
-	if (header.bitmap_info.height < 0) {
-		// If the height is negative, the rows are already in the expected order.
-		bytes_read = fread(image_bytes, 1, total_image_bytes, f);
-		if (bytes_read != (ssize_t)total_image_bytes) {
-			fclose(f);
-			fprintf(stderr, "Faild to read %zu image bytes.\n", total_image_bytes);
-			return false;
-		}
-	} else {
-		// If the height is positive we need to flip the rows.
-		uint8_t* row = image_bytes + row_size * (h - 1);
-		for (int row_i = 0; row_i < h; row_i++) {
-			bytes_read = fread(row, 1, row_size, f);
-			if (bytes_read != (ssize_t)total_image_bytes) {
-				fclose(f);
-				fprintf(stderr, "Faild to read %zu image bytes from row %d.\n", total_image_bytes, row_i);
-				return false;
-			}
-			row -= row_size;
-		}
-	}
-
-	fclose(f);
-	return true;
-}
-
 static bool VFDImage_load_(struct VFDImage* vfd_image, char const* path)
 {
 	void* image_bytes = malloc(BMP_MAX_IMAGE_BYTES(kVFDImage_width, kVFDImage_height));
 	assert(image_bytes);
-	if (!bmp_load_(path, kVFDImage_width, kVFDImage_height, image_bytes)) {
+	uint16_t bpp;
+	if (!bmp_load_(path, kVFDImage_width, kVFDImage_height, image_bytes, &bpp)) {
 		free(image_bytes);
 		fprintf(stderr, "Failed to load VFD BMP.\n");
 		return false;
@@ -1544,10 +1624,11 @@ static bool VFDImage_load_(struct VFDImage* vfd_image, char const* path)
 	// Convert BMP image bytes to the VFD format.
 	memset(vfd_image->p, 0, sizeof(vfd_image->p));
 	uint8_t const* row = image_bytes;
-	int stride = BMP_ROW_STRIDE(kVFDImage_width);
+	int stride = BMP_ROW_STRIDE(kVFDImage_width, bpp);
+	uint16_t const bytes_per_pixel = bpp / 8;
 	for (int y = 0; y < kVFDImage_height; y++) {
 		for (int x = 0; x < kVFDImage_width; x++) {
-			uint8_t const* p = row + x * BMP_BYTES_PER_PIXEL;
+			uint8_t const* p = row + x * bytes_per_pixel;
 			size_t const r = (size_t)p[0] * (size_t)212;
 			size_t const g = (size_t)p[1] * (size_t)701;
 			size_t const b = (size_t)p[2] * (size_t)87;
