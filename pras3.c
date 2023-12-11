@@ -15,6 +15,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define TEST(...) if (!(__VA_ARGS__)) { \
+	fprintf(stderr, "%s(%d): %s\n", __FILE__, __LINE__, #__VA_ARGS__); \
+	abort(); \
+}
+
 #ifdef _WIN32
 #	define IS_WINDOWS 1
 #	include <windows.h>
@@ -311,6 +316,7 @@ bool Serial_write(Serial serial, void const* buff, size_t size)
 
 #endif
 
+__attribute__((unused))
 static size_t jvs_encode_size_max(size_t unencoded_size)
 {
 	return unencoded_size * 2;
@@ -448,25 +454,25 @@ static void Color_test(void)
 {
 	struct OptionalColor c;
 	c = Color_from_string("0,");
-	assert(!c.has_value);
+	TEST(!c.has_value);
 	c = Color_from_string("0,0");
-	assert(!c.has_value);
+	TEST(!c.has_value);
 	c = Color_from_string("0,0,");
-	assert(!c.has_value);
+	TEST(!c.has_value);
 	c = Color_from_string("0,0,a");
-	assert(!c.has_value);
+	TEST(!c.has_value);
 	c = Color_from_string("0,0,0");
-	assert(c.has_value && c.color.r == 0 && c.color.g == 0 && c.color.b == 0);
+	TEST(c.has_value && c.color.r == 0 && c.color.g == 0 && c.color.b == 0);
 	c = Color_from_string("1,2,3");
-	assert(c.has_value && c.color.r == 1 && c.color.g == 2 && c.color.b == 3);
+	TEST(c.has_value && c.color.r == 1 && c.color.g == 2 && c.color.b == 3);
 	c = Color_from_string("1,2,256");
-	assert(!c.has_value);
+	TEST(!c.has_value);
 	c = Color_from_string("256,2,2");
-	assert(!c.has_value);
+	TEST(!c.has_value);
 	c = Color_from_string("2,256,2");
-	assert(!c.has_value);
+	TEST(!c.has_value);
 	c = Color_from_string("0xff,0xff,0xff");
-	assert(c.has_value && c.color.r == 0xff && c.color.g == 0xff && c.color.b == 0xff);
+	TEST(c.has_value && c.color.r == 0xff && c.color.g == 0xff && c.color.b == 0xff);
 }
 
 #define BMP_MAX_IMAGE_BYTES(w,h) ((w)*(h)*4)
@@ -529,6 +535,7 @@ static bool bmp_load_(char const* path, int expected_w, int expected_h, void* im
 	// Seek to the image bytes.
 	{
 		int err = fseek(f, header.image_data_offset, SEEK_SET);
+		(void)err;
 		assert(err == 0);
 	}
 	if (header.bitmap_info.height < 0) {
@@ -956,24 +963,24 @@ void UID_test(void)
 	// Bad strings.
 	// Invalid characters.
 	maybe_uid = UID_from_string("xx");
-	assert(!maybe_uid.has_value);
+	TEST(!maybe_uid.has_value);
 	// Odd number of chars.
 	maybe_uid = UID_from_string("1");
-	assert(!maybe_uid.has_value);
+	TEST(!maybe_uid.has_value);
 	// No leading '0x'.
 	maybe_uid = UID_from_string("0xff");
-	assert(!maybe_uid.has_value);
+	TEST(!maybe_uid.has_value);
 	// Too long.
 	maybe_uid = UID_from_string("00112233445566778899aabbccddeeff00");
-	assert(!maybe_uid.has_value);
+	TEST(!maybe_uid.has_value);
 
 	// Good strings.
 	maybe_uid = UID_from_string("ff");
-	assert(0 == strcmp("ff", UIDString_from_UID(&maybe_uid.uid).chars));
+	TEST(0 == strcmp("ff", UIDString_from_UID(&maybe_uid.uid).chars));
 	maybe_uid = UID_from_string("001122aabbcc");
-	assert(0 == strcmp("001122aabbcc", UIDString_from_UID(&maybe_uid.uid).chars));
+	TEST(0 == strcmp("001122aabbcc", UIDString_from_UID(&maybe_uid.uid).chars));
 	maybe_uid = UID_from_string("00112233445566778899aabbccddeeff");
-	assert(0 == strcmp("00112233445566778899aabbccddeeff", UIDString_from_UID(&maybe_uid.uid).chars));
+	TEST(0 == strcmp("00112233445566778899aabbccddeeff", UIDString_from_UID(&maybe_uid.uid).chars));
 }
 
 struct ArgsNFC {
@@ -1364,12 +1371,12 @@ static void encode_one_test(
 	unsigned char* encoded_str;
 	int encoded_size;
 	encoded_size = encode_string(unicode, unicode_len, encoding, NULL);
-	assert(encoded_size != -1);
-	assert(encoded_size = expected_str_len);
+	TEST(encoded_size != -1);
+	TEST(encoded_size = expected_str_len);
 	encoded_str = malloc(encoded_size);
-	assert(encoded_str);
+	TEST(encoded_str);
 	(void)encode_string(unicode, unicode_len, encoding, encoded_str);
-	assert(0 == memcmp(expected_str, encoded_str, encoded_size - 1));
+	TEST(0 == memcmp(expected_str, encoded_str, encoded_size - 1));
 }
 
 static void Encoding_test(void)

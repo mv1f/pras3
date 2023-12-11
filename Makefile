@@ -43,10 +43,10 @@ $(BUILD)/pras3: pras3.c enc.c enc.h | $(BUILD)
 	$(CC) $(CFLAGS) $< -o $@
 
 $(BUILD)/pras3_linux: pras3.c | $(BUILD)
-	zig cc -target x86_64-linux-musl -D_DEFAULT_SOURCE $(CFLAGS) $< -o $@
+	zig cc -target x86_64-linux-musl -O2 -D_DEFAULT_SOURCE $(CFLAGS) $< -o $@
 
 $(BUILD)/pras3.exe: pras3.c | $(BUILD)
-	zig cc -target x86_64-windows-gnu $(CFLAGS) $< -o $@
+	zig cc -target x86_64-windows-gnu -O2 $(CFLAGS) $< -o $@
 
 $(BUILD)/pras3_linux.zip: $(BUILD)/pras3_linux
 	cd $(BUILD); mv pras3_linux /tmp/pras3; pushd /tmp; zip pras3_linux.zip pras3; popd; mv /tmp/pras3_linux.zip .
